@@ -10,7 +10,12 @@ the problem and gives a recommended value. One file, standard library only.
 python3 sshcfg_audit.py                      # /etc/ssh/sshd_config and ~/.ssh/config if present
 python3 sshcfg_audit.py /etc/ssh/sshd_config
 python3 sshcfg_audit.py ./my_config --type ssh --min-severity MEDIUM
+python3 sshcfg_audit.py /etc/ssh/sshd_config --json
+# or: pip install git+https://github.com/TPOALOS/sshcfg-audit && sshcfg-audit /etc/ssh/sshd_config
 ```
+
+On Debian/Ubuntu `sshd_config` starts with `Include /etc/ssh/sshd_config.d/*.conf`, and a file there can silently re-enable
+password logins. Those files are audited too, and each finding names the file it came from.
 
 The file type is guessed from the name (`sshd` in the file name means server config);
 use `--type sshd|ssh` to force it.
@@ -42,8 +47,11 @@ ciphers, MACs, key exchange and host key algorithms (3DES, CBC, arcfour, MD5/SHA
 
 ## Limits
 
-- Only the global part of `sshd_config` is evaluated; `Match` blocks and `Include`d files are not.
-- The first occurrence of a setting wins, as in OpenSSH.
+- `Match` blocks are judged on their own values: a `Match` block that turns a risky setting on is reported with its
+  condition, one that only hardens is not. Whether a `Match` condition ever applies to a real connection is not evaluated.
+- `Include` lines are followed (glob patterns, nested up to 5 levels) when the file lives inside the config's own
+  directory; anything outside it, including symlinks that leave it, is refused with a warning. `--no-follow` turns this off.
+- The first occurrence of a setting wins, as in OpenSSH, including across included files.
 - Defaults assume a recent OpenSSH. Review each recommendation for your environment
   before applying it, and keep a second session open when changing `sshd_config`.
 

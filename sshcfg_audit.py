@@ -5,15 +5,19 @@ Reads configuration files offline (no network, no changes) and explains each
 finding with a recommended value. Standard library only.
 Exit code 0 = no findings, 1 = findings, 2 = error.
 
-Note: only the global section of sshd_config is evaluated; settings inside
-`Match` blocks are ignored. Defaults are for recent OpenSSH releases.
+Match blocks are checked too (a Match block can switch password logins or root login back on),
+and `Include` files are followed when they live inside the config's own directory.
+Defaults are for recent OpenSSH releases.
 """
 import argparse
+import glob
+import json
 import os
 import re
+import shlex
 import sys
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 SEV_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
 WEAK_ALGS = (
@@ -29,12 +33,9 @@ WEAK_ALGS = (
 )
 
 
-def parse(text):
-    """Yield (lineno, keyword_lower, value, context) for each directive.
-
-    context is 'global', the Host pattern, or 'match' for sshd Match blocks.
-    """
-    context = "global"
+def _parse(text):
+    """Yield (lineno, keyword_lower, value, context, match_condition)."""
+    context, cond = "global", ""
     for no, raw in enumerate(text.splitlines(), 1):
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -44,12 +45,21 @@ def parse(text):
             continue
         key, value = m.group(1).lower(), m.group(2).strip().strip('"')
         if key == "host":
-            context = value
+            context, cond = value, ""
             continue
         if key == "match":
-            context = "match"
+            context, cond = "match", value
             continue
-        yield no, key, value, context
+        yield no, key, value, context, cond
+
+
+def parse(text):
+    """Yield (lineno, keyword_lower, value, context) for each directive.
+
+    context is 'global', the Host pattern, or 'match' for sshd Match blocks.
+    """
+    for no, key, value, ctx, _ in _parse(text):
+        yield no, key, value, ctx
 
 
 def to_seconds(value):
@@ -71,63 +81,68 @@ def weak_algorithms(value):
     return out
 
 
-def audit_sshd(text):
-    findings, first = [], {}
-    for no, key, value, ctx in parse(text):
-        if ctx == "match" or key in first:
-            continue  # first occurrence wins; Match blocks not evaluated
-        first[key] = (no, value)
-    v = lambda k: first.get(k, (None, None))
-    add = lambda sev, no, key, msg, fix: findings.append((sev, no, key, msg, fix))
-
-    no, val = v("permitrootlogin")
-    if val and val.lower() == "yes":
-        add("HIGH", no, "PermitRootLogin", "root can log in with a password", "PermitRootLogin prohibit-password (or no)")
-    no, val = v("passwordauthentication")
-    if val is None:
-        add("LOW", None, "PasswordAuthentication", "not set; the default allows passwords", "PasswordAuthentication no (use keys)")
-    elif val.lower() != "no":
-        add("MEDIUM", no, "PasswordAuthentication", "password logins are enabled", "PasswordAuthentication no (use keys)")
-    for key, label, fix in (("permitemptypasswords", "PermitEmptyPasswords", "PermitEmptyPasswords no"),
-                            ("permituserenvironment", "PermitUserEnvironment", "PermitUserEnvironment no"),
-                            ("hostbasedauthentication", "HostbasedAuthentication", "HostbasedAuthentication no")):
-        no, val = v(key)
-        if val and val.lower() == "yes":
-            add("HIGH", no, label, "enabled; this weakens authentication", fix)
-    no, val = v("ignorerhosts")
-    if val and val.lower() == "no":
-        add("HIGH", no, "IgnoreRhosts", "rhosts files are honoured", "IgnoreRhosts yes")
-    no, val = v("strictmodes")
-    if val and val.lower() == "no":
-        add("MEDIUM", no, "StrictModes", "file permission checks are disabled", "StrictModes yes")
-    no, val = v("protocol")
-    if val and "1" in val.split(","):
-        add("HIGH", no, "Protocol", "SSH protocol 1 is insecure", "Protocol 2")
-    no, val = v("x11forwarding")
-    if val and val.lower() == "yes":
-        add("LOW", no, "X11Forwarding", "X11 forwarding enlarges the attack surface", "X11Forwarding no")
-    no, val = v("gatewayports")
-    if val and val.lower() in ("yes", "clientspecified"):
-        add("MEDIUM", no, "GatewayPorts", "forwarded ports may be exposed to the network", "GatewayPorts no")
-    no, val = v("maxauthtries")
-    if val and val.isdigit() and int(val) > 6:
-        add("MEDIUM", no, "MaxAuthTries", "many guesses allowed per connection (%s)" % val, "MaxAuthTries 3")
-    no, val = v("logingracetime")
-    if val is not None:
+def value_findings(key, val):
+    """(severity, label, message, fix) for one sshd directive value; absence checks live elsewhere."""
+    out, low = [], val.lower()
+    if key == "permitrootlogin" and low == "yes":
+        out.append(("HIGH", "PermitRootLogin", "root can log in with a password", "PermitRootLogin prohibit-password (or no)"))
+    elif key == "passwordauthentication" and low != "no":
+        out.append(("MEDIUM", "PasswordAuthentication", "password logins are enabled", "PasswordAuthentication no (use keys)"))
+    elif key in ("permitemptypasswords", "permituserenvironment", "hostbasedauthentication") and low == "yes":
+        label = {"permitemptypasswords": "PermitEmptyPasswords", "permituserenvironment": "PermitUserEnvironment",
+                 "hostbasedauthentication": "HostbasedAuthentication"}[key]
+        out.append(("HIGH", label, "enabled; this weakens authentication", "%s no" % label))
+    elif key == "ignorerhosts" and low == "no":
+        out.append(("HIGH", "IgnoreRhosts", "rhosts files are honoured", "IgnoreRhosts yes"))
+    elif key == "strictmodes" and low == "no":
+        out.append(("MEDIUM", "StrictModes", "file permission checks are disabled", "StrictModes yes"))
+    elif key == "protocol" and "1" in val.split(","):
+        out.append(("HIGH", "Protocol", "SSH protocol 1 is insecure", "Protocol 2"))
+    elif key == "x11forwarding" and low == "yes":
+        out.append(("LOW", "X11Forwarding", "X11 forwarding enlarges the attack surface", "X11Forwarding no"))
+    elif key == "gatewayports" and low in ("yes", "clientspecified"):
+        out.append(("MEDIUM", "GatewayPorts", "forwarded ports may be exposed to the network", "GatewayPorts no"))
+    elif key == "maxauthtries" and val.isdigit() and int(val) > 6:
+        out.append(("MEDIUM", "MaxAuthTries", "many guesses allowed per connection (%s)" % val, "MaxAuthTries 3"))
+    elif key == "logingracetime":
         secs = to_seconds(val)
         if secs == 0:
-            add("MEDIUM", no, "LoginGraceTime", "no time limit for authentication", "LoginGraceTime 30")
+            out.append(("MEDIUM", "LoginGraceTime", "no time limit for authentication", "LoginGraceTime 30"))
         elif secs is not None and secs > 60:
-            add("LOW", no, "LoginGraceTime", "long window for unauthenticated connections (%s)" % val, "LoginGraceTime 30")
-    no, val = v("clientaliveinterval")
-    if val is None or val == "0":
-        add("LOW", no, "ClientAliveInterval", "idle sessions are never dropped", "ClientAliveInterval 300 and ClientAliveCountMax 2")
-    for key, label in (("ciphers", "Ciphers"), ("macs", "MACs"), ("kexalgorithms", "KexAlgorithms"),
-                       ("hostkeyalgorithms", "HostKeyAlgorithms"), ("pubkeyacceptedalgorithms", "PubkeyAcceptedAlgorithms")):
-        no, val = v(key)
-        if val:
-            for sev, tok, why in weak_algorithms(val):
-                add(sev, no, label, "%s: %s" % (why, tok), "remove %s from %s" % (tok, label))
+            out.append(("LOW", "LoginGraceTime", "long window for unauthenticated connections (%s)" % val, "LoginGraceTime 30"))
+    elif key == "clientaliveinterval" and val == "0":
+        out.append(("LOW", "ClientAliveInterval", "idle sessions are never dropped",
+                    "ClientAliveInterval 300 and ClientAliveCountMax 2"))
+    elif key in ALG_KEYS:
+        for sev, tok, why in weak_algorithms(val):
+            out.append((sev, ALG_KEYS[key], "%s: %s" % (why, tok), "remove %s from %s" % (tok, ALG_KEYS[key])))
+    return out
+
+
+ALG_KEYS = {"ciphers": "Ciphers", "macs": "MACs", "kexalgorithms": "KexAlgorithms",
+            "hostkeyalgorithms": "HostKeyAlgorithms", "pubkeyacceptedalgorithms": "PubkeyAcceptedAlgorithms"}
+
+
+def audit_sshd(text):
+    findings, first = [], {}
+    for no, key, value, ctx, cond in _parse(text):
+        if ctx == "match":
+            # a Match block can undo a hardened global setting, so judge its values on their own
+            for sev, label, msg, fix in value_findings(key, value):
+                findings.append((sev, no, label, "%s (in Match %s)" % (msg, cond), fix))
+            continue
+        if key in first:
+            continue  # first occurrence wins
+        first[key] = (no, value)
+    for key, (no, val) in first.items():
+        for sev, label, msg, fix in value_findings(key, val):
+            findings.append((sev, no, label, msg, fix))
+    if "passwordauthentication" not in first:
+        findings.append(("LOW", None, "PasswordAuthentication", "not set; the default allows passwords",
+                         "PasswordAuthentication no (use keys)"))
+    if first.get("clientaliveinterval", (None, None))[1] is None:
+        findings.append(("LOW", None, "ClientAliveInterval", "idle sessions are never dropped",
+                         "ClientAliveInterval 300 and ClientAliveCountMax 2"))
     return findings
 
 
@@ -162,11 +177,64 @@ def audit(text, kind):
     return sorted(f, key=lambda x: (SEV_ORDER[x[0]], x[1] or 0))
 
 
+INCLUDE_RE = re.compile(r"(?i)^\s*include\s+(.+?)\s*$")
+MAX_INCLUDE_DEPTH = 5
+
+
+def load_config(path, follow=True, warn=lambda msg: None):
+    """Config text with Include files spliced in, plus origins[i] = (file, lineno) for combined line i+1.
+
+    Includes are followed only when they resolve inside the main file's directory (symlinks that leave it
+    are refused) so that auditing a copied config never reads unrelated files.
+    """
+    root = os.path.dirname(os.path.realpath(path))
+    lines, origins, seen = [], [], set()
+
+    def visit(p, depth):
+        real = os.path.realpath(p)
+        if real in seen:
+            return
+        seen.add(real)
+        with open(p, errors="replace") as fh:
+            raw_lines = fh.read().splitlines()
+        for n, raw in enumerate(raw_lines, 1):
+            m = INCLUDE_RE.match(raw) if follow else None
+            if not m or raw.lstrip().startswith("#"):
+                lines.append(raw)
+                origins.append((p, n))
+                continue
+            try:
+                patterns = shlex.split(m.group(1))
+            except ValueError:
+                patterns = m.group(1).split()
+            for pat in patterns:
+                pat = os.path.expanduser(pat)
+                target = pat if os.path.isabs(pat) else os.path.join(root, pat)
+                hits = sorted(glob.glob(target))
+                if not hits:
+                    warn("%s:%d: Include %s matched no files" % (p, n, pat))
+                for hit in hits:
+                    real_hit = os.path.realpath(hit)
+                    if not os.path.isfile(real_hit):
+                        continue
+                    if not (real_hit == root or real_hit.startswith(root + os.sep)):
+                        warn("%s:%d: not following %s: outside %s" % (p, n, hit, root))
+                    elif depth >= MAX_INCLUDE_DEPTH:
+                        warn("%s:%d: includes nested too deeply" % (p, n))
+                    else:
+                        visit(hit, depth + 1)
+
+    visit(path, 0)
+    return "\n".join(lines), origins
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Audit sshd_config / ssh client config (read-only).")
     ap.add_argument("files", nargs="*", help="config files (default: /etc/ssh/sshd_config, ~/.ssh/config)")
     ap.add_argument("--type", choices=("sshd", "ssh"), help="force file type (default: guess from name)")
     ap.add_argument("--min-severity", choices=("LOW", "MEDIUM", "HIGH"), default="LOW")
+    ap.add_argument("--no-follow", action="store_true", help="do not follow Include lines")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--version", action="version", version=__version__)
     args = ap.parse_args(argv)
     files = args.files or [p for p in ("/etc/ssh/sshd_config", os.path.expanduser("~/.ssh/config"))
@@ -175,24 +243,34 @@ def main(argv=None):
         print("sshcfg-audit: no config files given or found", file=sys.stderr)
         return 2
     limit = SEV_ORDER[args.min_severity]
-    count = 0
+    results = []
     for path in files:
         try:
-            with open(path, errors="replace") as fh:
-                text = fh.read()
+            text, origins = load_config(path, not args.no_follow, lambda m: print("sshcfg-audit: warning: %s" % m, file=sys.stderr))
         except OSError as exc:
             print("sshcfg-audit: %s" % exc, file=sys.stderr)
             return 2
         kind = args.type or ("sshd" if "sshd" in os.path.basename(path) else "ssh")
-        print("== %s (%s)" % (path, kind))
+        found = []
         for sev, no, key, msg, fix in audit(text, kind):
             if SEV_ORDER[sev] > limit:
                 continue
-            count += 1
-            print("%-6s %s%s: %s\n         fix: %s" % (sev, key, ":%d" % no if no else "", msg, fix))
+            src, line = origins[no - 1] if no and no <= len(origins) else (path, no)
+            found.append({"severity": sev, "key": key, "file": src, "line": line, "message": msg, "fix": fix})
+        results.append({"path": path, "type": kind, "findings": found})
+    count = sum(len(r["findings"]) for r in results)
+    if args.json:
+        print(json.dumps(results, indent=2))
+    else:
+        for r in results:
+            print("== %s (%s)" % (r["path"], r["type"]))
+            for f in r["findings"]:
+                where = ""
+                if f["line"]:
+                    where = ":%d" % f["line"] if f["file"] == r["path"] else " (%s:%d)" % (f["file"], f["line"])
+                print("%-6s %s%s: %s\n         fix: %s" % (f["severity"], f["key"], where, f["message"], f["fix"]))
     print("sshcfg-audit: %d finding(s)" % count, file=sys.stderr)
     return 1 if count else 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
